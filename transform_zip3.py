@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-ZIP3-State Spatial Transformation Script
+ZIP3-State Spatial Transformation Script (Border-Trimmed Version)
 
 This script transforms Census ZCTA (ZIP Code Tabulation Areas) data into 
 state-ZIP3 polygons for Tableau visualization. It creates dissolved polygons 
-representing the intersection of state boundaries and first-three-digit ZIP prefixes.
+with precise state boundaries by clipping ZIPs to state borders before dissolving.
+
+This replaces the original script and produces border-trimmed polygons that 
+eliminate >100% coverage issues caused by ZIP boundary overlaps.
 
 Requirements:
-- cb_2018_us_zcta510_500k.shp (and associated files) must be present
+- cb_2018_us_zcta510_500k.shp (and associated files) from Census Bureau
 - Internet connection for downloading state boundaries if needed
-- GeoPandas ≥0.14, Pandas, and Requests
+- GeoPandas ≥0.14, pyogrio, Pandas, and Requests
 
 Output:
-- ./out/state_zip3_dissolved.shp
-- ./out/state_zip3_dissolved.gpkg (layer="zip3_state")
+- ./out/state_zip3_trimmed.shp
+- ./out/state_zip3_trimmed.gpkg (layer="zip3_state")
 """
 
 import os
 import sys
+import time
 import zipfile
 import requests
 import geopandas as gpd
@@ -127,35 +131,75 @@ def ensure_same_crs(zcta_gdf, state_gdf):
     
     return zcta_gdf, state_gdf
 
-def spatial_join_and_filter(zcta_gdf, state_gdf):
-    """Perform spatial join and filter problematic geometries"""
-    print("🔗 Performing spatial join (ZCTAs to states)...")
+def spatial_join_and_clip(zcta_gdf, state_gdf):
+    """Assign ZIPs to states and clip to state boundaries (border-trimmed approach)"""
+    print("🎯 Assigning ZIPs to states using 'within' predicate...")
     
-    # Spatial join using 'intersects' predicate
-    joined_gdf = gpd.sjoin(zcta_gdf, state_gdf, how='inner', predicate='intersects')
+    # First, try spatial join with 'within' predicate for clean assignments
+    within_join = gpd.sjoin(zcta_gdf, state_gdf, how='inner', predicate='within')
+    within_join = within_join.drop(columns=['index_right'])
+    print(f"   {len(within_join)} ZIPs assigned via 'within' predicate")
     
-    # Drop the index column created by sjoin
-    joined_gdf = joined_gdf.drop(columns=['index_right'])
+    # Find ZIPs that straddle state boundaries (not captured by 'within')
+    assigned_zips = set(within_join['GEOID10'])
+    straddling_zips = zcta_gdf[~zcta_gdf['GEOID10'].isin(assigned_zips)].copy()
+    print(f"   {len(straddling_zips)} border-straddling ZIPs need centroid assignment")
     
-    print(f"   Joined {len(joined_gdf)} ZCTA-state combinations")
+    # For straddling ZIPs, use centroid-based assignment
+    if len(straddling_zips) > 0:
+        centroids = straddling_zips.copy()
+        centroids['geometry'] = centroids.geometry.centroid
+        centroid_join = gpd.sjoin(centroids, state_gdf, how='inner', predicate='within')
+        centroid_join = centroid_join.drop(columns=['index_right'])
+        
+        # Restore original geometry for centroid-assigned ZIPs
+        centroid_join['geometry'] = straddling_zips.set_index('GEOID10').loc[centroid_join['GEOID10'], 'geometry'].values
+        
+        print(f"   {len(centroid_join)} ZIPs assigned via centroid method")
+        
+        # Combine both assignment methods
+        all_assigned = pd.concat([within_join, centroid_join], ignore_index=True)
+    else:
+        all_assigned = within_join
     
-    # Filter out problematic Alaskan/Hawaiian multipolygons if needed
-    # Keep only simple polygons or well-formed multipolygons
-    original_count = len(joined_gdf)
-    joined_gdf = joined_gdf[joined_gdf.geometry.is_valid].copy()
+    print(f"   Total assigned: {len(all_assigned)} ZIPs to states")
     
-    if len(joined_gdf) < original_count:
-        print(f"   Filtered out {original_count - len(joined_gdf)} invalid geometries")
+    # Warn about unassigned ZIPs
+    total_unassigned = len(zcta_gdf) - len(all_assigned)
+    if total_unassigned > 0:
+        print(f"   ⚠️  {total_unassigned} ZIPs could not be assigned to any state")
     
-    return joined_gdf
+    # Now clip ZIP geometries to state boundaries
+    print("✂️  Clipping ZIP geometries to state boundaries...")
+    clipped_parts = []
+    
+    for state in state_gdf['STUSPS'].unique():
+        state_geom = state_gdf[state_gdf['STUSPS'] == state].geometry.iloc[0]
+        state_zips = all_assigned[all_assigned['STUSPS'] == state].copy()
+        
+        if len(state_zips) > 0:
+            # Clip ZIPs to state boundary
+            state_zips['geometry'] = state_zips.geometry.intersection(state_geom)
+            clipped_parts.append(state_zips)
+    
+    if clipped_parts:
+        clipped_gdf = pd.concat(clipped_parts, ignore_index=True)
+        # Remove any empty geometries created by clipping
+        clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
+        print(f"   Clipped to {len(clipped_gdf)} state-constrained ZIP polygons")
+        return clipped_gdf
+    else:
+        print("   ❌ No valid clipped geometries created")
+        return gpd.GeoDataFrame()
 
-def dissolve_by_state_zip3(joined_gdf):
-    """Dissolve by state and ZIP3 to create final polygons"""
+def dissolve_by_state_zip3(clipped_gdf):
+    """Dissolve by state and ZIP3 to create final trimmed polygons"""
     print("🔄 Dissolving by State × ZIP3...")
     
     # Group by state and ZIP3, then dissolve
-    dissolved_gdf = joined_gdf.dissolve(by=['STUSPS', 'ZIP3']).reset_index()
+    dissolved_gdf = clipped_gdf.dissolve(by=['STUSPS', 'ZIP3']).reset_index()
     
+    print("🔧 Fixing geometry issues...")
     # Fix any invalid geometries created by dissolve
     dissolved_gdf['geometry'] = dissolved_gdf['geometry'].buffer(0)
     
@@ -184,43 +228,48 @@ def simplify_geometry(gdf):
     return gdf_simplified
 
 def export_results(gdf):
-    """Export results to both shapefile and GeoPackage"""
-    print("💾 Exporting results...")
+    """Export trimmed results to both shapefile and GeoPackage"""
+    print("💾 Exporting trimmed results...")
     
     # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     # Export to shapefile
-    shp_path = os.path.join(OUTPUT_DIR, "state_zip3_dissolved.shp")
+    shp_path = os.path.join(OUTPUT_DIR, "state_zip3_trimmed.shp")
     gdf.to_file(shp_path)
     print(f"   ✅ Shapefile saved: {shp_path}")
     
     # Export to GeoPackage
-    gpkg_path = os.path.join(OUTPUT_DIR, "state_zip3_dissolved.gpkg")
+    gpkg_path = os.path.join(OUTPUT_DIR, "state_zip3_trimmed.gpkg")
     gdf.to_file(gpkg_path, layer="zip3_state", driver="GPKG")
     print(f"   ✅ GeoPackage saved: {gpkg_path} (layer: zip3_state)")
     
     return shp_path, gpkg_path
 
-def print_summary(gdf):
+def print_summary(gdf, processing_time=None):
     """Print concise summary of results"""
     num_polygons = len(gdf)
     num_states = gdf['STUSPS'].nunique()
     
     print("\n" + "="*60)
-    print("📊 TRANSFORMATION COMPLETE!")
+    print("🎯 BORDER-TRIMMED ZIP3-STATE LAYER COMPLETE!")
     print("="*60)
-    print(f"Created {num_polygons} polygons covering {num_states} states")
+    print(f"Created {num_polygons} trimmed polygons covering {num_states} states")
+    if processing_time:
+        print(f"Processing time: {processing_time:.1f} seconds")
     print(f"Output files saved to ./{OUTPUT_DIR}/")
     print("\nFor Tableau:")
-    print("  1. Data → Spatial File → Select state_zip3_dissolved.gpkg")
+    print("  1. Data → Spatial File → Select state_zip3_trimmed.gpkg")
     print("  2. Choose layer: zip3_state")
     print("  3. Join on: STUSPS (state) and ZIP3 (ZIP prefix)")
+    print("  4. Enjoy clean state boundaries! 🎉")
     print("="*60)
 
 def main():
     """Main execution function"""
-    print("🚀 Starting ZIP3-State Spatial Transformation")
+    start_time = time.time()
+    
+    print("🚀 Starting ZIP3-State Border-Trimmed Transformation")
     print("="*60)
     
     # Step 1: Safety check
@@ -235,11 +284,11 @@ def main():
     # Step 4: Ensure same CRS
     zcta_gdf, state_gdf = ensure_same_crs(zcta_gdf, state_gdf)
     
-    # Step 5: Spatial join and filter
-    joined_gdf = spatial_join_and_filter(zcta_gdf, state_gdf)
+    # Step 5: Spatial join and clip to state boundaries
+    clipped_gdf = spatial_join_and_clip(zcta_gdf, state_gdf)
     
     # Step 6: Dissolve by state and ZIP3
-    dissolved_gdf = dissolve_by_state_zip3(joined_gdf)
+    dissolved_gdf = dissolve_by_state_zip3(clipped_gdf)
     
     # Step 7: Simplify geometry (optional)
     simplified_gdf = simplify_geometry(dissolved_gdf)
@@ -247,8 +296,9 @@ def main():
     # Step 8: Export results
     export_results(simplified_gdf)
     
-    # Step 9: Print summary
-    print_summary(simplified_gdf)
+    # Step 9: Print summary with timing
+    processing_time = time.time() - start_time
+    print_summary(simplified_gdf, processing_time)
 
 if __name__ == "__main__":
     main()

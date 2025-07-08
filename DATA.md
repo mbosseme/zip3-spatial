@@ -5,9 +5,11 @@ This directory should contain the Census ZCTA shapefile data.
 ## Required Files
 
 Download the 2018 Census ZCTA shapefile (500k scale) from:
-https://www.census.gov/geographies/mapping-files/time-series/geo/cartographic-boundary.html
+**https://www.census.gov/geographies/mapping-files/time-series/geo/carto-boundary-file.html**
 
-Required files:
+Look for: "2018 ZIP Code Tabulation Areas (ZCTAs)" → "cb_2018_us_zcta510_500k.zip"
+
+Required files (after extracting the ZIP):
 - `cb_2018_us_zcta510_500k.shp`
 - `cb_2018_us_zcta510_500k.dbf`
 - `cb_2018_us_zcta510_500k.shx`
@@ -15,7 +17,7 @@ Required files:
 - `cb_2018_us_zcta510_500k.cpg`
 
 ## File Size
-The complete dataset is approximately 200-300 MB.
+The complete ZIP download is approximately 200-300 MB.
 
 ## Automatic Downloads
 State boundary files will be downloaded automatically by the scripts when needed.
