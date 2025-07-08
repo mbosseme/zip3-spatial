@@ -1,0 +1,19 @@
+# Core dependencies for ZIP3-State spatial transformation
+geopandas==1.1.1
+pandas==2.3.1
+requests==2.32.4
+pyogrio==0.11.0
+shapely==2.1.1
+pyproj==3.7.1
+numpy==2.3.1
+urllib3==2.5.0
+
+# Additional dependencies (automatically installed)
+certifi==2025.6.15
+charset-normalizer==3.4.2
+idna==3.10
+packaging==25.0
+python-dateutil==2.9.0.post0
+pytz==2025.2
+six==1.17.0
+tzdata==2025.2
